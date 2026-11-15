@@ -23,7 +23,10 @@
 //   names the kind: "budget is spent" and "is out" are permanent (that provider serves no more of this
 //   trial), "refused this call" is transient (the provider may answer a later call number). A provider
 //   that answers a refusal is never retried for the same request: the next call number may be another
-//   refusal, and a different provider is the cheaper recovery.
+//   refusal, and a different provider is the cheaper recovery. One refusal spends nothing at all: a
+//   429 with the concurrent_requests code means the provider was busy serving another call, and its own
+//   call count never moved — so it is not counted toward the load-spreading tally either, or the
+//   provider would be capped a real call early for a call it never took.
 //   One provider call answers each request: the first success is used, and no further provider is tried.
 //
 // THE WIRES (lib/wire.ts)
@@ -253,19 +256,27 @@ interface CallOutcome {
   message: string;
 }
 
-/** The error message of a provider's refusal body, in any of the three wires' shapes. */
-function refusalMessage(text: string): string {
+/** The error message and the error code of a provider's refusal body, in any of the three wires' shapes. */
+function refusalDetail(text: string, wire: 'openai' | 'anthropic' | 'gemini'): { message: string; code: string } {
+  const fallback = { message: text.slice(0, 200), code: '' };
+  let value: unknown;
   try {
-    const value: unknown = JSON.parse(text);
-    if (!isRecord(value)) return text.slice(0, 200);
-    if (isRecord(value.error)) {
-      if (typeof value.error.message === 'string') return value.error.message;
-      if (isRecord(value.error.error) && typeof value.error.error.message === 'string') return value.error.error.message;
-    }
-    return text.slice(0, 200);
+    value = JSON.parse(text);
   } catch {
-    return text.slice(0, 200);
+    return fallback;
   }
+  if (!isRecord(value) || !isRecord(value.error)) return fallback;
+  const error = value.error;
+  const message =
+    typeof error.message === 'string'
+      ? error.message
+      : isRecord(error.error) && typeof error.error.message === 'string'
+        ? error.error.message
+        : text.slice(0, 200);
+  // The code rides a different member on each wire: error.code on OpenAI, error.type on Anthropic
+  // (its envelope's type carries the provider's code), error.status on Gemini.
+  const code = wire === 'openai' ? error.code : wire === 'anthropic' ? error.type : error.status;
+  return { message, code: typeof code === 'string' ? code : '' };
 }
 
 /** Whether a refusal's message names a permanent end: the budget spent, or an outage. */
@@ -310,7 +321,13 @@ async function callProvider(candidate: Candidate, norm: NormalizedRequest): Prom
   }
   const text = await upstream.text();
   if (!upstream.ok) {
-    const message = refusalMessage(text);
+    const { message, code } = refusalDetail(text, provider.wire);
+    if (code === 'concurrent_requests') {
+      // A provider that is busy refuses with 429 and the concurrent_requests code, and that refusal
+      // spends none of its budget: its own call count never moved. Undo the increment this call made
+      // before the fetch, so the load-spreading tally counts only calls the provider really took.
+      providerCalls.set(provider.id, Math.max(0, (providerCalls.get(provider.id) ?? 0) - 1));
+    }
     return { ok: false, answer: null, permanent: isPermanentRefusal(message), status: upstream.status, message };
   }
   const answer =
